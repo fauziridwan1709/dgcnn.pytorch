@@ -22,7 +22,16 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
+from torch_geometric.nn import GATConv
 
+# def get_edge_index(num_points, k, device):
+  #  row = torch.arange(num_points, device=device).repeat(k)
+   # col = torch.zeros(k, num_points, device=device).long()
+    #for i in range(num_points):
+     #   col[:,i] = torch.randperm(num_points, device=device)[:k]
+   # col = col.view(-1)
+   # edge_index = torch.stack([row,col], dim=0)
+   # return edge_index
 
 def knn(x, k):
     inner = -2*torch.matmul(x.transpose(2, 1), x)
@@ -93,6 +102,198 @@ class PointNet(nn.Module):
         x = self.linear2(x)
         return x
 
+def get_edge_index(x, k):
+    batch_size, num_points, _ = x.size()
+    idx = knn(x, k=k)   # (batch_size, num_points, k)
+    idx_base = torch.arange(0, batch_size).view(-1, 1, 1) * num_points
+    idx = idx + idx_base
+    idx = idx.view(batch_size, num_points * k)
+
+    src = idx.repeat(1, k).view(batch_size, -1)
+    dst = idx.unsqueeze(2).repeat(1, 1, k).view(batch_size, -1)
+    edge_index = torch.stack([src, dst], dim=0)
+    return edge_index
+
+class DGCNN_cls2(nn.Module):
+    def __init__(self, args, output_channels=40):
+        super(DGCNN_cls, self).__init__()
+        self.args = args
+        self.k = args.k
+
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.bn5 = nn.BatchNorm1d(args.emb_dims)
+
+        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
+                                   self.bn1,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv2 = nn.Sequential(nn.Conv2d(64*2, 64, kernel_size=1, bias=False),
+                                   self.bn2,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv3 = nn.Sequential(nn.Conv2d(64*2, 128, kernel_size=1, bias=False),
+                                   self.bn3,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv4 = nn.Sequential(nn.Conv2d(128*2, 256, kernel_size=1, bias=False),
+                                   self.bn4,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.conv5 = nn.Sequential(nn.Conv1d(512, args.emb_dims, kernel_size=1, bias=False),
+                                   self.bn5,
+                                   nn.LeakyReLU(negative_slope=0.2))
+        self.linear1 = nn.Linear(args.emb_dims*2, 512, bias=False)
+        self.bn6 = nn.BatchNorm1d(512)
+        self.dp1 = nn.Dropout(p=args.dropout)
+        self.linear2 = nn.Linear(512, 256)
+        self.bn7 = nn.BatchNorm1d(256)
+        self.dp2 = nn.Dropout(p=args.dropout)
+        self.linear3 = nn.Linear(256, output_channels)
+
+        # Add GATConv layers
+        self.gatconv1 = GATConv(64, 64, heads=1, concat=False)
+        self.gatconv2 = GATConv(64, 128, heads=1, concat=False)
+        self.gatconv3 = GATConv(128, 256, heads=1, concat=False)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        num_points = x.size(2)
+
+        x = x.view(batch_size, -1, num_points)
+
+        edge_index = get_edge_index(x, k=self.k)
+
+        x = x.permute(0, 2, 1)
+        x1 = self.conv1(x.unsqueeze(3)).squeeze(3)
+        x1 = self.gatconv1(x1, edge_index)
+        x1 = F.leaky_relu(x1, negative_slope=0.2)
+
+        edge_index = get_edge_index(x1, k=self.k)
+
+        x2 = self.conv2(x1.unsqueeze(3)).squeeze(3)
+        x2 = self.gatconv2(x2, edge_index)
+        x2 = F.leaky_relu(x2, negative_slope=0.2)
+
+        edge_index = get_edge_index(x2, k=self.k)
+
+        x3 = self.conv3(x2.unsqueeze(3)).squeeze(3)
+        x3 = self.gatconv3(x3, edge_index)
+        x3 = F.leaky_relu(x3, negative_slope=0.2)
+
+        x4 = self.conv4(x3.unsqueeze(3)).squeeze(3)
+
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+
+        x = self.conv5(x.permute(0, 2, 1))
+        x1 = F.adaptive_max_pool1d(x, 1).view(batch_size, -1)
+        x2 = F.adaptive_avg_pool1d(x, 1).view(batch_size, -1)
+        x = torch.cat((x1, x2), 1)
+
+        x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)
+        x = self.dp1(x)
+        x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)
+        x = self.dp2(x)
+        x = self.linear3(x)
+
+        return x
+
+class DGCNN_cls3(nn.Module):
+    def __init__(self, args, output_channels=40):
+        super(DGCNN_cls, self).__init__()
+        self.args = args
+        self.k = args.k
+
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.bn5 = nn.BatchNorm1d(args.emb_dims)
+
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(6, 64, kernel_size=1, bias=False),
+            self.bn1,
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64*2, 64, kernel_size=1, bias=False),
+            self.bn2,
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64*2, 128, kernel_size=1, bias=False),
+            self.bn3,
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(128*2, 256, kernel_size=1, bias=False),
+            self.bn4,
+            nn.LeakyReLU(negative_slope=0.2)
+        )
+
+        self.gat1 = GATConv(256, 512, heads=4)
+        self.gat2 = GATConv(512*4, args.emb_dims, heads=8)
+
+        self.linear1 = nn.Linear(args.emb_dims*2, 512, bias=False)
+        self.bn6 = nn.BatchNorm1d(512)
+        self.dp1 = nn.Dropout(p=args.dropout)
+        self.linear2 = nn.Linear(512, 256)
+        self.bn7 = nn.BatchNorm1d(256)
+        self.dp2 = nn.Dropout(p=args.dropout)
+        self.linear3 = nn.Linear(256, output_channels)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        num_points = x.size(2)
+
+        x = get_graph_feature(x, k=self.k)
+        x = self.conv1(x)
+        x1 = x.max(dim=-1, keepdim=False)[0]
+
+        x = get_graph_feature(x1, k=self.k)
+        x = self.conv2(x)
+        x2 = x.max(dim=-1, keepdim=False)[0]
+
+        x = get_graph_feature(x2, k=self.k)
+        x = self.conv3(x)
+        x3 = x.max(dim=-1, keepdim=False)[0]
+
+        x = get_graph_feature(x3, k=self.k)
+        x = self.conv4(x)
+        x4 = x.max(dim=-1, keepdim=False)[0]
+
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+        x = F.dropout(x, p=self.args.dropout, training=self.training)
+
+        x_flat = x.view(batch_size, -1, num_points).transpose(1, 2) 
+        x_flat = x_flat.reshape(batch_size * num_points, -1)
+
+        device = x.device
+        edge_index = get_edge_index(num_points, self.k, device)
+        x_flat = x_flat[:, :256]
+
+        x = self.gat1(x_flat, edge_index)
+        x = F.elu(x)
+        x = F.dropout(x, p=self.args.dropout, training=self.training)
+
+        x = self.gat2(x, edge_index)
+        x = F.elu(x)
+        x = F.dropout(x, p=self.args.dropout, training=self.training)
+
+        x = x.view(batch_size, num_points, -1)
+
+        x1 = F.adaptive_max_pool1d(x, 1).view(batch_size, -1)
+        x2 = F.adaptive_avg_pool1d(x, 1).view(batch_size, -1)
+        x = torch.cat((x1, x2), 1)
+
+        x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)
+        x = self.dp1(x)
+        x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)
+        x = self.dp2(x)
+        x = self.linear3(x)
+
+        return x
 
 class DGCNN_cls(nn.Module):
     def __init__(self, args, output_channels=40):
